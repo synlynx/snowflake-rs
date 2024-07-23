@@ -13,6 +13,7 @@ clippy::future_not_send, // This one seems like something we should eventually f
 clippy::missing_panics_doc
 )]
 
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::Arc;
@@ -29,10 +30,12 @@ use thiserror::Error;
 
 use responses::ExecResponse;
 use session::{AuthError, Session};
-
+use crate::bindings::BindingError;
+pub use crate::bindings::ToSql;
 use crate::connection::QueryType;
 use crate::connection::{Connection, ConnectionError};
-use crate::requests::ExecRequest;
+use crate::polars::PolarsCastError;
+use crate::requests::{Bindings, ExecRequest, ParameterBinding};
 use crate::responses::{ExecResponseRowType, SnowflakeType};
 use crate::session::AuthError::MissingEnvArgument;
 
@@ -43,6 +46,7 @@ mod put;
 mod requests;
 mod responses;
 mod session;
+mod bindings;
 
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
@@ -56,7 +60,7 @@ pub enum SnowflakeApiError {
     ResponseDeserializationError(#[from] base64::DecodeError),
 
     #[error(transparent)]
-    ArrowError(#[from] arrow::error::ArrowError),
+    ArrowError(#[from] ArrowError),
 
     #[error("S3 bucket path in PUT request is invalid: `{0}`")]
     InvalidBucketPath(String),
@@ -96,6 +100,13 @@ pub enum SnowflakeApiError {
 
     #[error(transparent)]
     GlobError(#[from] glob::GlobError),
+
+    #[error(transparent)]
+    BindingError(#[from] BindingError),
+
+    #[cfg(feature = "polars")]
+    #[error(transparent)]
+    PolarsCastError(#[from] PolarsCastError)
 }
 
 /// Even if Arrow is specified as a return type non-select queries
@@ -388,6 +399,13 @@ impl SnowflakeApi {
     /// If statement is PUT, then file will be uploaded to the Snowflake-managed storage
     /// Returns raw bytes in the Arrow response
     pub async fn exec_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
+        self.exec_arrow_raw(sql, BTreeMap::new()).await
+    }
+
+    /// Executes a single query against API.
+    /// If statement is PUT, then file will be uploaded to the Snowflake-managed storage
+    /// Returns raw bytes in the Arrow response
+    pub async fn exec_raw_with_bindings(&self, sql: &'static str, bindings: BTreeMap<String, Box<dyn ToSql>>) -> Result<RawQueryResult, SnowflakeApiError> {
         let put_re = Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").unwrap();
 
         // put commands go through a different flow and result is side-effect
@@ -395,7 +413,7 @@ impl SnowflakeApi {
             log::info!("Detected PUT query");
             self.exec_put(sql).await.map(|()| RawQueryResult::Empty)
         } else {
-            self.exec_arrow_raw(sql).await
+            self.exec_arrow_raw(sql, bindings).await
         }
     }
 
@@ -429,10 +447,30 @@ impl SnowflakeApi {
             .await
     }
 
-    async fn exec_arrow_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
+    fn convert_bindings(bindings: BTreeMap<String, Box<dyn ToSql>>) -> Result<Option<BTreeMap<String, ParameterBinding>>, SnowflakeApiError> {
+        let mut mapped_bindings = BTreeMap::new();
+        for binding in bindings {
+
+            let mapped = ParameterBinding::try_from(binding.1)?;
+            mapped_bindings.insert(binding.0, mapped);
+        }
+
+        if mapped_bindings.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(mapped_bindings))
+        }
+        
+        
+    }
+    
+    async fn exec_arrow_raw(&self, sql: &str, bindings: BTreeMap<String, Box<dyn ToSql>>) -> Result<RawQueryResult, SnowflakeApiError> {
+        let binding = Self::convert_bindings(bindings)?;
+
         let resp = self
-            .run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
+            .run_sql_with_bindings::<ExecResponse>(sql, QueryType::ArrowQuery, binding)
             .await?;
+
         log::debug!("Got query response: {:?}", resp);
 
         let resp = match resp {
@@ -486,6 +524,15 @@ impl SnowflakeApi {
         sql_text: &str,
         query_type: QueryType,
     ) -> Result<R, SnowflakeApiError> {
+        self.run_sql_with_bindings(sql_text, query_type, None).await
+    }
+
+    async fn run_sql_with_bindings<R: serde::de::DeserializeOwned>(
+        &self,
+        sql_text: &str,
+        query_type: QueryType,
+        bindings: Option<Bindings>
+    ) -> Result<R, SnowflakeApiError> {
         log::debug!("Executing: {}", sql_text);
 
         let parts = self.session.get_token().await?;
@@ -495,6 +542,7 @@ impl SnowflakeApi {
             async_exec: false,
             sequence_id: parts.sequence_id,
             is_internal: false,
+            bindings
         };
 
         let resp = self

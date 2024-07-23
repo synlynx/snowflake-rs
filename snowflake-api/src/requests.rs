@@ -1,4 +1,46 @@
+use std::collections::BTreeMap;
+use bytes::BytesMut;
 use serde::Serialize;
+use crate::bindings::{BindingError, ToSql};
+use crate::responses::SnowflakeType;
+
+
+
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum BindingValue {
+    SingleBind(String),
+    MultiBind(Vec<String>)
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterBinding {
+    #[serde(rename = "type")]
+    pub type_: Option<SnowflakeType>,
+    pub fmt: Option<String>,
+    pub value: BindingValue
+}
+
+impl TryFrom<Box<dyn ToSql>> for ParameterBinding {
+    type Error = BindingError;
+
+    fn try_from(value: Box<dyn ToSql>) -> Result<Self, Self::Error> {
+        let mut buffer = BytesMut::new();
+        value.to_sql(&mut buffer)?;
+        let buffer = buffer.freeze();
+
+        let params = String::from_utf8(buffer.to_vec())?;
+        Ok(ParameterBinding {
+            type_: Some(SnowflakeType::Fixed),
+            fmt: None,
+            value: BindingValue::SingleBind(params)
+        })
+    }
+}
+
+pub type Bindings = BTreeMap<String, ParameterBinding>;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -7,6 +49,7 @@ pub struct ExecRequest {
     pub async_exec: bool,
     pub sequence_id: u64,
     pub is_internal: bool,
+    pub bindings: Option<Bindings>
 }
 
 #[derive(Serialize, Debug)]
