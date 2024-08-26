@@ -33,7 +33,7 @@ impl TryFrom<Box<dyn ToSql>> for ParameterBinding {
 
         let params = String::from_utf8(buffer.to_vec())?;
         Ok(ParameterBinding {
-            type_: Some(SnowflakeType::Fixed),
+            type_: Some(value.sql_type()),
             fmt: None,
             value: BindingValue::SingleBind(params)
         })
