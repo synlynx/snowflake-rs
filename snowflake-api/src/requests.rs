@@ -5,6 +5,9 @@ use crate::bindings::{BindingError, ToSql};
 use crate::responses::SnowflakeType;
 
 
+#[derive(Serialize, Debug)]
+pub struct EmptyRequest {}
+
 
 
 #[derive(Serialize, Debug)]

@@ -264,7 +264,7 @@ mod chrono_impls {
         };
     }
 
-    date_time_impl!(chrono::NaiveDate, SnowflakeType::Date, "%Y-%m-%d");
+    date_time_impl!(chrono::NaiveDate, SnowflakeType::Text, "%Y-%m-%d");
     date_time_impl!(chrono::NaiveDateTime, SnowflakeType::TimestampNtz, "%Y-%m-%d %H:%M:%S.%.3f");
     date_time_impl!(chrono::DateTime<Local>, SnowflakeType::TimestampLtz, "%Y-%m-%d %H:%M:%S.%.3f");
     date_time_impl!(chrono::DateTime<FixedOffset>, SnowflakeType::TimestampTz, "%Y-%m-%d %H:%M:%S.%.3f %z");

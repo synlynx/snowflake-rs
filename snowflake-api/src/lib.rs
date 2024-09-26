@@ -34,10 +34,11 @@ use crate::bindings::BindingError;
 pub use crate::bindings::ToSql;
 use crate::connection::QueryType;
 use crate::connection::{Connection, ConnectionError};
-use crate::polars::PolarsCastError;
-use crate::requests::{Bindings, ExecRequest, ParameterBinding};
+pub use crate::polars::PolarsCastError;
+use crate::requests::{Bindings, EmptyRequest, ExecRequest, ParameterBinding};
 use crate::responses::{ExecResponseRowType, SnowflakeType};
 use crate::session::AuthError::MissingEnvArgument;
+use crate::SnowflakeApiError::{ApiError, SqlCompilationError};
 
 pub mod connection;
 #[cfg(feature = "polars")]
@@ -82,6 +83,9 @@ pub enum SnowflakeApiError {
 
     #[error("Snowflake API error. Code: `{0}`. Message: `{1}`")]
     ApiError(String, String),
+
+    #[error("{0}")]
+    SqlCompilationError(String),
 
     #[error("Snowflake API empty response could mean that query wasn't executed correctly or API call was faulty")]
     EmptyResponse,
@@ -471,11 +475,17 @@ impl SnowflakeApi {
             .run_sql_with_bindings::<ExecResponse>(sql, QueryType::ArrowQuery, binding)
             .await?;
 
-        log::debug!("Got query response: {:?}", resp);
-
-        let resp = match resp {
+        let mut resp = match resp {
             // processable response
-            ExecResponse::Query(qr) => Ok(qr),
+            ExecResponse::Query(qr) => {
+                match qr.code.as_deref() {
+                    // TODO what other response error codes exist?
+                    Some("001003") | Some("000904") => {
+                        Err(SqlCompilationError(qr.message.unwrap_or_else(|| "SQL compilation error".into())))
+                    },
+                    _ => Ok(qr)
+                }
+            },
             ExecResponse::PutGet(_) => Err(SnowflakeApiError::UnexpectedResponse),
             ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
                 e.data.error_code,
@@ -483,9 +493,24 @@ impl SnowflakeApi {
             )),
         }?;
 
+        while resp.is_async() {
+            let url = resp.data.get_result_url.as_ref().unwrap();
+            resp = match self.poll::<ExecResponse>(&url).await? {
+                ExecResponse::Query(qr) => qr,
+                ExecResponse::PutGet(_) => return Err(SnowflakeApiError::UnexpectedResponse),
+                ExecResponse::Error(e) => {
+                    return Err(SnowflakeApiError::ApiError(
+                        e.data.error_code,
+                        e.message.unwrap_or_default(),
+                    ))
+                }
+            };
+        }
+
         // if response was empty, base64 data is empty string
+        // unwrap should be safe as we checked for async status
         // todo: still return empty arrow batch with proper schema? (schema always included)
-        if resp.data.returned == 0 {
+        if resp.data.returned.unwrap() == 0 {
             log::debug!("Got response with 0 rows");
             Ok(RawQueryResult::Empty)
         } else if let Some(value) = resp.data.rowset {
@@ -495,7 +520,13 @@ impl SnowflakeApi {
             // information being passed through that fields.
             Ok(RawQueryResult::Json(JsonResult {
                 value,
-                schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
+                schema: resp
+                    .data
+                    .rowtype
+                    .unwrap()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             }))
         } else if let Some(base64) = resp.data.rowset_base64 {
             // fixme: is it possible to give streaming interface?
@@ -553,6 +584,29 @@ impl SnowflakeApi {
                 &[],
                 Some(&parts.session_token_auth_header),
                 body,
+                None,
+            )
+            .await?;
+
+        Ok(resp)
+    }
+
+    async fn poll<R: serde::de::DeserializeOwned>(
+        &self,
+        get_result_url: &str,
+    ) -> Result<R, SnowflakeApiError> {
+        log::debug!("Polling: {}", get_result_url);
+
+        let parts = self.session.get_token().await?;
+        let resp = self
+            .connection
+            .request::<R>(
+                QueryType::ArrowQuery,
+                &self.account_identifier,
+                &[],
+                Some(&parts.session_token_auth_header),
+                EmptyRequest {},
+                Some(get_result_url),
             )
             .await?;
 
